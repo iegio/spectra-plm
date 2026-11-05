@@ -4,7 +4,7 @@
 
 SPECTRA applies the Discrete Cosine Transform (DCT) or Discrete Fourier Transform (DFT) along the protein sequence dimension to capture sequence-level information beyond conventional mean pooling. We investigate both relative-frequency and physical-frequency representations across protein language models and downstream prediction tasks.
 
-![SPECTRA Overview](figures/overview.png)
+![SPECTRA Overview](figures/overview.pdf)
 
 ## Repository Structure
 
