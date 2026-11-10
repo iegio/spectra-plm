@@ -1,194 +1,31 @@
 from utils import *
-from plm_wrapper_bylayer import *
+from plm_wrapper import *
 from nets import *
 from scipy.stats import spearmanr
-from scipy.fft import dct, idct
-from scipy.interpolate import interp1d
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
 import numpy as np
 
-import copy
 import torch.nn.functional as F
-from scipy.special import expit
-from sklearn.metrics import precision_recall_curve, auc, average_precision_score
 
-DEEP_PROTEIN_ROOT = os.environ.get('DEEP_PROTEIN_ROOT', '/home/ml1875/DCT_FFT_benchmarking/Minh_Code/DeepProtein')
+DEEP_PROTEIN_ROOT ='datasets/DeepProtein'
 sys.path.append(os.path.dirname(DEEP_PROTEIN_ROOT))
-artifact_dir = "/scratch/gpfs/MONA/ml1875/bom_pooling_codebase/artifact/deepprotein_final_epoch"
+artifact_dir = "outputs/deepprotein/artifact"
 os.makedirs(artifact_dir, exist_ok=True)
 
 from DeepProtein.dataset import *
-# ============================================================
+
 # SPECTRAL FUNCTIONS
-# ============================================================
-
-eps = 1e-12
-
-def prost_idct(X, config, n_freqs, maxF=None):
-    minmax = config[0] == "minmax"
-    quantize = config[1] == "quantize"
-
-    X = np.asarray(X, dtype=np.float32)
-    L, D = X.shape
-    N = int(n_freqs)
-    M = D // N
-
-    if D % N != 0:
-        raise ValueError(f"Embedding dimension {D} must be divisible by N={N}")
-
-    # Pad short protein sequences to N positions.
-    if L < N:
-        X = np.pad(X, ((0, N - L), (0, 0)), mode="constant")
-
-    def scale(v):
-        vmin, vmax = np.min(v), np.max(v)
-        return (v - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(v)
-
-    def idct_compress(v, n):
-        coeff = dct(v, type=2, axis=0, norm="ortho")[:n]
-        compressed = idct(coeff, type=2, axis=0, norm="ortho")
-
-        if minmax:
-            for j in range(compressed.shape[1]):
-                compressed[:, j] = scale(compressed[:, j])
-
-        return compressed
-
-    Y = idct_compress(X, N)
-    Y = idct_compress(Y.T, M).T
-    out = Y.reshape(-1)
-
-    if quantize:
-        if not minmax:
-            raise ValueError("Quantization requires minmax normalization.")
-        out = np.trunc(out * 127).astype(np.int8).astype(np.float32)
-
-    return out
-
-def relative_dct(X, n_freqs, maxF=None):
-    L, D = X.shape
-
-    # Compute all available DCT coefficients
-    coeffs = dct(X, type=2, axis=0, norm="ortho")
-
-    trajectory = np.zeros((n_freqs, D), dtype=np.float32)
-
-    # Number of available coefficients
-    n_available = min(n_freqs, L)
-
-    if n_available > 0:
-        trajectory[:n_available] = coeffs[:n_available]
-
-    # Coefficient transformation
-    trajectory[1:] = np.abs(trajectory[1:])
-
-    # Remove DC: mean pooling is handled by the independent PCA branch.
-    trajectory = trajectory[1:]
-
-    # Spectral normalization
-    trajectory /= (np.linalg.norm(trajectory, axis=1, keepdims=True) + eps)
-
-    assert trajectory.shape == (n_freqs - 1, D)
-    return trajectory.reshape(-1).astype(np.float32)
-
-def relative_fft(X, config, n_freqs, maxF):
-    transform = config[1]
-    L, D = X.shape
-
-    # For magnitude_zpad, append zeros to double the boundary-adjusted sequence length.
-    zpad = transform.split("_")[-1] == "zpad"
-    fft_len = 2 * X.shape[0] if zpad else X.shape[0]
-    F = np.fft.rfft(X, n=fft_len, axis=0, norm="ortho")
-    if zpad: F = F[:-1]  # L coefficients: omit the Nyquist bin
-
-    # Number of available coefficients
-    assert F.shape[0] == (X.shape[0] if zpad else X.shape[0] // 2 + 1)
-    n_available = min(n_freqs, F.shape[0])
-    F = F[:n_available]
-
-    # Coefficient transform
-    trajectory = np.abs(F)
-    trajectory[0] = F[0].real
-
-    # Zero-pad to n_freqs
-    padded = np.zeros((n_freqs, D), dtype=np.float32)
-    padded[:n_available] = trajectory
-    trajectory = padded
-
-    # Remove DC: mean pooling is handled by the independent PCA branch.
-    trajectory = trajectory[1:]
-
-    # Spectral normalization
-    trajectory /= (np.linalg.norm(trajectory, axis=1, keepdims=True) + eps)
-
-    return trajectory.reshape(-1).astype(np.float32)
-
-def physical_dct(X, config, n_freqs, maxF):
-    L, D = X.shape
-
-    # Compute all available DCT coefficients
-    C = dct(X, type=2, axis=0, norm="ortho")
-    C = np.abs(C)
-
-    freqs = np.arange(L, dtype=np.float64) / (2.0 * L)
-    freq_grid = np.linspace(0.0, maxF, n_freqs, endpoint=False, dtype=np.float64)
-    profile = interp1d(freqs, C, kind="linear", axis=0, bounds_error=False,
-                       fill_value=0.0, assume_sorted=True)(freq_grid).astype(np.float32)
-
-    # Remove DC: mean pooling is handled by the independent PCA branch.
-    profile = profile[1:]
-
-    # Spectral normalization
-    profile /= (np.linalg.norm(profile, axis=1, keepdims=True) + eps)
-    assert profile.shape == (n_freqs - 1, D)
-    return profile.reshape(-1).astype(np.float32)
-
-def physical_fft(X, config, n_freqs, maxF):
-    _, D = X.shape
-
-    # Zero-padding doubles the FFT length; omit Nyquist to retain L coefficients.
-    zpad = transform.split("_")[-1] == "zpad"
-    fft_len = 2 * X.shape[0] if zpad else X.shape[0]
-    F = np.fft.rfft(X, n=fft_len, axis=0, norm="ortho")
-    dc = F[0].real.copy()
-
-    # Physical-frequency coordinates
-    freqs = np.fft.rfftfreq(fft_len, d=1.0)[:len(F)]
-
-    freq_grid = np.linspace(0.0, maxF, n_freqs, endpoint=False, dtype=np.float64)
-
-    # Coefficient transformation before interpolation
-    n_channels = 1
-    trajectory = np.abs(F)
-
-    # Interpolate onto common physical-frequency grid
-    profile = interp1d(freqs, trajectory, kind="linear", axis=0, bounds_error=False,
-                       fill_value=0.0, assume_sorted=True)(freq_grid).astype(np.float32)
-
-    # Remove DC: mean pooling is handled by the independent PCA branch.
-    profile = profile[1:]
-
-
-    profile /= np.linalg.norm(profile, axis=1, keepdims=True) + eps
-
-    assert profile.shape == (n_freqs - 1, D)
-    return profile.reshape(-1).astype(np.float32)
-
 configs_funcs = {
     'dct_relative': relative_dct,
-    'fft_relative': relative_fft,
+    'dft_relative': relative_dft,
     'dct_physical': physical_dct,
-    'fft_physical': physical_fft,
+    'dft_physical': physical_dft,
     'prost_idct': prost_idct,
 }
 
-
-# ============================================================
-# BRANCHED PCA: MEAN + SPECTRAL
-# ============================================================
 PCA_SEED = 42
 def fit_branched_pca(train_mean, train_spectral, emb_dim, seed=PCA_SEED):
     pca_dim = emb_dim // 2
@@ -203,16 +40,10 @@ def fit_branched_pca(train_mean, train_spectral, emb_dim, seed=PCA_SEED):
 
     return mean_scaler, mean_pca, spectral_scaler, spectral_pca
 
-
 def transform_branched_pca(mean_features, spectral_features, mean_scaler, mean_pca, spectral_scaler, spectral_pca):
     mean_features = mean_pca.transform(mean_scaler.transform(mean_features))
     spectral_features = spectral_pca.transform(spectral_scaler.transform(spectral_features))
     return torch.tensor(np.concatenate([mean_features, spectral_features], axis=1), dtype=torch.float32)
-
-
-# ============================================================
-# MODEL / TRAINING
-# ============================================================
 
 class LLMPredictor(nn.Module):
     def __init__(self, **kwargs):
@@ -256,42 +87,28 @@ def evaluate_model(model, data, fold='test', task=None):
     y_pred = torch.cat(y_pred).flatten().cpu()
     eval_label = eval_label.flatten().cpu()
 
-    if task == 'solubility':
-        y_true = eval_label.numpy().astype(int)
-        y_prob = expit(y_pred.numpy())
-
-        if len(np.unique(y_true)) < 2:
-            raise ValueError(f'Solubility {fold} fold contains only one class.')
-
-        precision, recall, _ = precision_recall_curve(y_true, y_prob)
-        score = auc(recall, precision)
-    else:
-        score, _ = spearmanr(y_pred.numpy(), eval_label.numpy())
+    score, _ = spearmanr(y_pred.numpy(), eval_label.numpy())
 
     return y_pred, float(score)
 
 def format_float_for_filename(x):
     return f"{x:g}".replace(".", "p")
 
-def experiment_tag(method, layer_ix, N, maxF, config_ix):
-    if method in ['avg', 'avg_aMean', 'avg_bMean', 'cls']:
+def experiment_tag(method, layer_ix, N, maxF):
+    if method in ['mean', 'mean_standardized', 'cls']:
         return f'{method}_layer{layer_ix}'
-    return f'{method}_layer{layer_ix}_N{N}_fmax{format_float_for_filename(maxF)}_config{config_ix}'
+    return f'{method}_layer{layer_ix}_N{N}_fmax{format_float_for_filename(maxF)}'
 
-def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **kwargs):
+def train_model(task, emb_model, method, layer_ix, N, maxF, seed, **kwargs):
     set_seed(seed)
 
-    tag = experiment_tag(method, layer_ix, N, maxF, config_ix)
-    exp_name = f'dp_{task}_{emb_model}_{tag}_noDC_residueOnly'
-
-    if task == 'solubility':
-        exp_name += '_BCE_PRAUC'
+    tag = experiment_tag(method, layer_ix, N, maxF)
+    exp_name = f'dp_{task}_{emb_model}_{tag}'
 
     save_path = f'{artifact_dir}/{exp_name}_seed{seed}.pt'
-    # checkpoint_path = f'{c}/{exp_name}_seed{seed}_best.pt'
     checkpoint_path = f'{artifact_dir}/{exp_name}_seed{seed}_best.pt'
 
-    data = load_data(task, emb_model, method, layer_ix, N, maxF, config_ix, seed)
+    data = load_data(task, emb_model, method, layer_ix, N, maxF, seed)
 
     print(f"Train: {len(data['train_y']):,}")
     print(f"Valid: {len(data['valid_y']):,}")
@@ -308,14 +125,7 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
     n_epochs = kwargs.get('n_epochs', 400)
     interval = kwargs.get('interval', 1)
 
-    is_classification = task == 'solubility'
-    metric_name = 'pr_auc' if is_classification else 'rho'
-
-    if is_classification:
-        for fold in ['train', 'valid', 'test']:
-            labels = data[f'{fold}_y'].flatten().cpu()
-            assert torch.all((labels == 0) | (labels == 1)), f'Non-binary labels in {fold}'
-            print(f'{fold}: n={len(labels)}, positive fraction={labels.float().mean().item():.4f}')
+    metric_name = 'rho'
 
     history = {
         'y_pred': [],
@@ -348,12 +158,8 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
 
         history['eval_epochs'].append(epoch)
 
-        if is_classification:
-            history['valid_pr_auc'].append(valid_score)
-            print(f'Epoch {epoch}: valid PR-AUC = {valid_score * 100:.2f}%')
-        else:
-            history['valid_rho'].append(valid_score)
-            print(f'Epoch {epoch}: valid Spearman rho = {valid_score:.5f}')
+        history['valid_rho'].append(valid_score)
+        print(f'Epoch {epoch}: valid Spearman rho = {valid_score:.5f}')
 
         scheduler.step(-valid_score)
 
@@ -402,10 +208,7 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
                 x = data['train_x'][idx_batch].to('cuda')
                 y_pred = model(x).flatten()
 
-            if is_classification:
-                loss = F.binary_cross_entropy_with_logits(y_pred, y_batch)
-            else:
-                loss = F.huber_loss(y_pred, y_batch)
+            loss = F.huber_loss(y_pred, y_batch)
 
             bar.set_postfix_str(f'Batch Loss = {loss.item():.5f}')
 
@@ -426,10 +229,6 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
         if (ep + 1) % interval == 0 or ep == n_epochs - 1:
             validate_and_save(ep + 1)
 
-    # ============================================================
-    # FINAL-EPOCH EVALUATION
-    # ============================================================
-
     # Save the model after exactly n_epochs completed training epochs.
     final_checkpoint_path = f'{artifact_dir}/{exp_name}_seed{seed}_final.pt'
 
@@ -447,32 +246,18 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
     history['final_epoch'] = n_epochs
     history['final_test_score'] = float(final_score)
 
-    # ============================================================
-    # BEST-VALIDATION CHECKPOINT EVALUATION
-    # ============================================================
-
     # Restore the model selected by validation performance.
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location='cuda',
-        weights_only=False
-    )
+    checkpoint = torch.load(checkpoint_path, map_location='cuda', weights_only=False)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
     # Evaluate the validation-selected model on the test set.
-    best_pred, best_score_test = evaluate_model(
-        model, data, fold='test', task=task
-    )
+    best_pred, best_score_test = evaluate_model(model, data, fold='test', task=task)
 
     history['best_epoch'] = int(checkpoint['epoch'])
     history['best_valid_score'] = float(checkpoint['valid_score'])
     history['best_test_score'] = float(best_score_test)
-
-    # ============================================================
-    # PRESERVE EXISTING HISTORY FORMAT
-    # ============================================================
 
     # Keep test_score as the best-validation-selected test result.
     history['test_score'] = float(best_score_test)
@@ -481,29 +266,10 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
 
     history['y_pred'].append(best_pred)
 
-    if is_classification:
-        history['pr_auc'].append(float(best_score_test))
+    history['rho'].append(float(best_score_test))
 
-        test_labels = data['test_y'].flatten().cpu().numpy().astype(int)
-
-        history['final_test_ap'] = float(
-            average_precision_score(test_labels, expit(final_pred.numpy()))
-        )
-        history['best_test_ap'] = float(
-            average_precision_score(test_labels, expit(best_pred.numpy()))
-        )
-
-        # Preserve the existing field.
-        history['test_ap'] = history['best_test_ap']
-
-        print(f'Final epoch {n_epochs}: test PR-AUC = {final_score * 100:.2f}%')
-        print(f'Best validation epoch {checkpoint["epoch"]}: test PR-AUC = {best_score_test * 100:.2f}%')
-
-    else:
-        history['rho'].append(float(best_score_test))
-
-        print(f'Final epoch {n_epochs}: test Spearman rho = {final_score:.5f}')
-        print(f'Best validation epoch {checkpoint["epoch"]}: test Spearman rho = {best_score_test:.5f}')
+    print(f'Final epoch {n_epochs}: test Spearman rho = {final_score:.5f}')
+    print(f'Best validation epoch {checkpoint["epoch"]}: test Spearman rho = {best_score_test:.5f}')
 
     print(f'Best validation score: {checkpoint["valid_score"]:.5f}')
 
@@ -514,10 +280,7 @@ def train_model(task, emb_model, method, layer_ix, N, maxF, config_ix, seed, **k
 
     return history
 
-# ============================================================
-# DATA / EMBEDDING
-# ============================================================
-def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
+def load_data(task, emb_model_name, method, layer_ix, N, maxF):
     def collate_ppi(dataset):
         x1, x2, y = [], [], []
         for i in range(len(dataset)):
@@ -527,9 +290,8 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
             y.append(float(target))
         return x1, x2, torch.tensor(y, dtype=torch.float32)
     deep_prot_data_dir = f'{DEEP_PROTEIN_ROOT}/data'
-    tag = experiment_tag(method, layer_ix, N, maxF, config_ix)
-    # exp_name = f'dp_{task}_{emb_model_name}_{tag}'
-    exp_name = f'dp_{task}_{emb_model_name}_{tag}_noDC_residueOnly'
+    tag = experiment_tag(method, layer_ix, N, maxF)
+    exp_name = f'dp_{task}_{emb_model_name}_{tag}'
     save_path = f'{DATA_ROOT}/{task}/{exp_name}.pt'
     print(exp_name, save_path)
 
@@ -540,13 +302,9 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
             assert 'valid_x1' in data and 'valid_x2' in data
             assert 'test_x1' in data and 'test_x2' in data
         return data
-
-    if task == 'beta_lactamase':
-        train, valid, test = Beta_lactamase(deep_prot_data_dir, 'train'), Beta_lactamase(deep_prot_data_dir, 'valid'), Beta_lactamase(deep_prot_data_dir, 'test')
-    elif task == 'fluorescence':
+    
+    if task == 'fluorescence':
         train, valid, test = FluorescenceDataset(deep_prot_data_dir, 'train'), FluorescenceDataset(deep_prot_data_dir, 'valid'), FluorescenceDataset(deep_prot_data_dir, 'test')
-    elif task == 'solubility':
-        train, valid, test = Solubility(deep_prot_data_dir, 'train'), Solubility(deep_prot_data_dir, 'valid'), Solubility(deep_prot_data_dir, 'test')
     elif task == 'ppi_affinity':
         train, valid, test = PPI_Affinity(deep_prot_data_dir, 'train'), PPI_Affinity(deep_prot_data_dir, 'valid'), PPI_Affinity(deep_prot_data_dir, 'test')
     else:
@@ -563,8 +321,7 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
 
     # config = configs[method][config_ix]
     # spectral_func = configs_funcs[method]
-    is_avg = method in ['avg', 'avg_aMean', 'avg_bMean', 'cls']
-    config = None if is_avg else configs[method][config_ix]
+    is_avg = method in ['mean', 'mean_standardized', 'cls']
     spectral_func = None if is_avg else configs_funcs[method]
 
     emb_model = PLM[emb_model_name]()
@@ -572,7 +329,7 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
 
     if is_avg:
         def embed_avg(fold_x, fold, protein_ix=None, collect_stats=False, chunk_size=1000):
-            pool_dir = 'cls' if method == 'cls' else 'avg_shared'
+            pool_dir = 'cls' if method == 'cls' else 'mean_shared'
             cache_dir = f'{DATA_ROOT}/chunks/{task}/{emb_model_name}/{pool_dir}/layer{layer_ix}'
             os.makedirs(cache_dir, exist_ok=True)
 
@@ -635,23 +392,11 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
 
             means_all = torch.cat(means_all, dim=0)
 
-            if collect_stats and method == 'avg_bMean':
-                return (
-                    means_all,
-                    torch.from_numpy(residue_sum_all),
-                    torch.from_numpy(residue_sumsq_all),
-                    n_residues_all
-                )
-
             return means_all
         
         if task == 'ppi_affinity':
             train_emb1 = embed_avg(train_x1, 'train', protein_ix=1, collect_stats=True)
             train_emb2 = embed_avg(train_x2, 'train', protein_ix=2, collect_stats=True)
-            
-            if method == 'avg_bMean':
-                train_emb1, sum1, sq1, n1 = train_emb1
-                train_emb2, sum2, sq2, n2 = train_emb2
 
             valid_emb1 = embed_avg(valid_x1, 'valid', protein_ix=1)
             valid_emb2 = embed_avg(valid_x2, 'valid', protein_ix=2)
@@ -659,35 +404,22 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
             test_emb1 = embed_avg(test_x1, 'test', protein_ix=1)
             test_emb2 = embed_avg(test_x2, 'test', protein_ix=2)
 
-            if method == 'avg_aMean':
+            if method == 'mean_standardized':
                 train_all = torch.cat([train_emb1, train_emb2])
                 mu = train_all.mean(0)
                 sigma = train_all.std(0, unbiased=False)
 
-            elif method == 'avg_bMean':
-                mu = (sum1 + sum2) / (n1 + n2)
-                var = (sq1 + sq2) / (n1 + n2) - mu ** 2
-                sigma = torch.sqrt(torch.clamp(var, min=0.0))
-
         else:
             train_emb = embed_avg(train_x, 'train', collect_stats=True)
-
-            if method == 'avg_bMean':
-                train_emb, residue_sum, residue_sumsq, n_residues = train_emb
 
             valid_emb = embed_avg(valid_x, 'valid')
             test_emb = embed_avg(test_x, 'test')
 
-            if method == 'avg_aMean':
+            if method == 'mean_standardized':
                 mu = train_emb.mean(0)
                 sigma = train_emb.std(0, unbiased=False)
 
-            elif method == 'avg_bMean':
-                mu = residue_sum / n_residues
-                var = residue_sumsq / n_residues - mu ** 2
-                sigma = torch.sqrt(torch.clamp(var, min=0.0))
-
-        if method in ['avg_aMean', 'avg_bMean']:
+        if method == 'mean_standardized':
             sigma = torch.clamp(sigma, min=1e-12)
             standardize = lambda x: ((x - mu) / sigma).float()
 
@@ -698,7 +430,7 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
             else:
                 train_emb, valid_emb, test_emb = standardize(train_emb), standardize(valid_emb), standardize(test_emb)
 
-        if method in ['avg', 'cls']:
+        if method in ['mean', 'cls']:
             if task == 'ppi_affinity':
                 train_emb1, train_emb2 = train_emb1.float(), train_emb2.float()
                 valid_emb1, valid_emb2 = valid_emb1.float(), valid_emb2.float()
@@ -707,7 +439,7 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
                 train_emb, valid_emb, test_emb = train_emb.float(), valid_emb.float(), test_emb.float()
 
     def embed_spectral(fold_x, fold, protein_ix=None, chunk_size=10000):
-        cache_dir = f'{DATA_ROOT}/chunks/{task}/{emb_model_name}/{method}/layer{layer_ix}/N{N}/fmax{maxF}/config{config_ix}'
+        cache_dir = f'{DATA_ROOT}/chunks/{task}/{emb_model_name}/{method}/layer{layer_ix}/N{N}/fmax{maxF}'
         os.makedirs(cache_dir, exist_ok=True)
 
         prefix = f'{fold}_protein{protein_ix}' if protein_ix is not None else fold
@@ -734,7 +466,7 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
                     if method != 'prost_idct':
                         chunk_mean.append(X.mean(0))
 
-                    chunk_spectral.append(spectral_func(X, config=config, n_freqs=N, maxF=maxF))
+                    chunk_spectral.append(spectral_func(X, n_freqs=N, maxF=maxF))
 
             tmp_path = chunk_path + '.tmp.npz'
             np.savez(
@@ -826,41 +558,31 @@ def load_data(task, emb_model_name, method, layer_ix, N, maxF, config_ix, seed):
     torch.save(data, save_path)
     return data
 
-# ============================================================
-# COMMAND LINE
-# python file.py TASK METHOD LAYER_IX N MAXF CONFIG_IX
-# ============================================================
-
+# python file.py TASK METHOD LAYER_IX N MAXF EMB_MODEL SEED
 if __name__ == '__main__':
     task = sys.argv[1]
     method = sys.argv[2]
     LAYER_IX = int(sys.argv[3])
     N = int(sys.argv[4])
     MAXF = float(sys.argv[5])
-    config_ix = int(sys.argv[6])
+    emb_model = sys.argv[6]
     seed = int(sys.argv[7])
-    emb_model = sys.argv[8]
 
-    assert task in ['fluorescence', 'beta_lactamase', 'ppi_affinity']
-    assert method in ['dct_relative', 'fft_relative', 'dct_physical', 'fft_physical', 'prost_idct', 'avg', 'avg_aMean', 'avg_bMean', 'cls']
+    assert task in ['fluorescence', 'ppi_affinity']
+    assert method in ['dct_relative', 'dft_relative', 'dct_physical', 'dft_physical', 'prost_idct', 'mean', 'mean_standardized', 'cls']
     assert method != 'cls' or emb_model.startswith('esm2-')
-    if method in configs:
-        assert 0 <= config_ix < len(configs[method])
+    assert emb_model in ['esm2-650M', 'prottrans']
+
     kwargs = {'n_epochs': 100, 'interval': 1, 'batch_size': 48, 'lr': 1e-4}
 
-    print("model:", emb_model)
+    
     print("TASK:", task)
     print("METHOD:", method)
     print("LAYER:", LAYER_IX)
     print("N_FREQS:", N)
     print("MAXF:", MAXF)
-    print("CONFIG_IX:", config_ix)
-    print("CONFIG:", configs[method][config_ix] if method in configs else None)
+    print("MODEL:", emb_model)
+    print("SEED:", seed)
 
-    # for seed in seeds:
-    print(f"\n===== SEED {seed} =====")
-    train_model(
-        task, emb_model, method, LAYER_IX, N, MAXF, config_ix, seed,
-        **kwargs
-    )
+    train_model(task, emb_model, method, LAYER_IX, N, MAXF, seed, **kwargs)
     
